@@ -1,43 +1,51 @@
-import argparse
 import asyncio
 import logging
 import os
+import time
+import fractions
 import cv2
 import av
-import fractions
-import time
 
 from aiohttp import web
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, AudioStreamTrack
-from av import VideoFrame, AudioFrame
-from aiortc.mediastreams import MediaStreamError # <--- IMPORT THIS
+from aiortc import (
+    RTCPeerConnection,
+    RTCSessionDescription,
+    VideoStreamTrack,
+    AudioStreamTrack,
+)
+from aiortc.mediastreams import MediaStreamError
+from av import VideoFrame
 
-# Enable logging so you can SEE the pacing happen in the terminal
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("PACER")
+logger = logging.getLogger("RTC")
 
-# --- CONFIGURATION ---
+# ================= CONFIG =================
 FPS = 25
+VIDEO_CLOCK = 90000
+VIDEO_FRAME_TICKS = VIDEO_CLOCK // FPS
+
 AUDIO_RATE = 48000
-CHUNK_SIZE = int(AUDIO_RATE / FPS)  # 1920 samples (40ms)
+AUDIO_FRAME_MS = 20
+AUDIO_SAMPLES = int(AUDIO_RATE * AUDIO_FRAME_MS / 1000)
+
 FRAME_DIR = "test_data/frames"
 AUDIO_PATH = "test_data/audio.wav"
+# ==========================================
 
-# --- 1. THE CONSUMER TRACKS (Stage 3) ---
-# These just read from Buffer B (Slow Queue).
-# If Buffer B is empty, these NATURALLY wait.
+
+# ============ CONSUMER TRACKS ==============
 class ConsumerVideoTrack(VideoStreamTrack):
     def __init__(self, queue):
         super().__init__()
         self.queue = queue
 
     async def recv(self):
-        # This blocks until the Pacer puts a frame in Buffer B
-        frame = await self.queue.get() 
+        frame = await self.queue.get()
         if frame is None:
             self.stop()
-            raise MediaStreamError() # <--- Graceful Stop
+            raise MediaStreamError()
         return frame
+
 
 class ConsumerAudioTrack(AudioStreamTrack):
     def __init__(self, queue):
@@ -48,160 +56,184 @@ class ConsumerAudioTrack(AudioStreamTrack):
         frame = await self.queue.get()
         if frame is None:
             self.stop()
-            raise MediaStreamError() # <--- Graceful Stop
+            raise MediaStreamError()
         return frame
+# ===========================================
 
-# --- 2. THE PACER (Stage 2: The Valve) ---
-# This task moves data from A -> B at STRICT 25 FPS
-async def strict_pacer(raw_v_q, raw_a_q, slow_v_q, slow_a_q):
-    print(">>> Pacer Started: Clock initialized.")
-    
-    start_time = time.time()
-    frame_count = 0
-    frame_duration = 1.0 / FPS
 
-    while True:
-        # 1. Fetch from Buffer A (Instant)
-        v_frame = await raw_v_q.get()
-        a_frame = await raw_a_q.get()
+# ============ FAST PRODUCER =================
+async def fast_producer(raw_audio_q, raw_video_q):
+    logger.info("Producer: running FAST")
 
-        if v_frame is None: 
-            # End of Stream logic
-            await slow_v_q.put(None)
-            await slow_a_q.put(None)
-            print(">>> Pacer: Stream Complete.")
-            break
+    frames = sorted(
+        os.path.join(FRAME_DIR, f)
+        for f in os.listdir(FRAME_DIR)
+        if f.endswith(".jpg")
+    )
+    num_video_frames = len(frames)
+    video_duration_sec = num_video_frames / FPS
+    total_audio_samples = int(video_duration_sec * AUDIO_RATE)
 
-        # 2. HEARTBEAT LOG (Verify Speed)
-        # Every 25 frames (1 second), print status
-        if frame_count % 25 == 0:
-            print(f"PACER HEARTBEAT: Streaming {frame_count/25:.0f}s / {time.time()-start_time:.1f}s real-time")
+    logger.info(
+        f"Producer: {num_video_frames} video frames → "
+        f"{video_duration_sec:.2f}s total"
+    )
 
-        # 3. Wait for Target Time
-        target_time = start_time + (frame_count * frame_duration)
-        wait_time = target_time - time.time()
-        
-        if wait_time > 0:
-            await asyncio.sleep(wait_time)
-
-        # 4. Release to Buffer B
-        await slow_v_q.put(v_frame)
-        await slow_a_q.put(a_frame)
-        
-        frame_count += 1
-
-# --- 3. THE PRODUCER (Stage 1: The Fast Model) ---
-async def fast_producer(raw_v_q, raw_a_q):
-    logger.info(">>> Producer: Generating as fast as possible...")
-    
     container = av.open(AUDIO_PATH)
     audio_stream = container.streams.audio[0]
-    
-    # 1. PREPARE TOOLS
-    # Resampler: Converts whatever the wav file is -> Standard WebRTC Format (s16, 48k, stereo)
-    resampler = av.AudioResampler(format='s16', layout='stereo', rate=AUDIO_RATE)
-    # FIFO: The "Meat Slicer" to get exact 40ms chunks
+
+    resampler = av.AudioResampler(
+        format="s16",
+        layout="stereo",
+        rate=AUDIO_RATE,
+    )
     fifo = av.AudioFifo()
-    
-    frame_files = sorted([os.path.join(FRAME_DIR, f) for f in os.listdir(FRAME_DIR) if f.endswith(".jpg")])
-    total_frames = len(frame_files)
-    frame_idx = 0
-    pts_counter = 0
+
+    video_idx = 0
+    video_pts = 0
+    audio_pts = 0
 
     for packet in container.demux(audio_stream):
-        for raw_frame in packet.decode():
-            
-            # --- FIX: RESAMPLE BEFORE BUFFERING ---
-            # We must convert the raw frame (which might be Planar) to Packed s16
-            # before putting it in the FIFO.
-            cleaned_frames = resampler.resample(raw_frame)
-            
-            for clean_frame in cleaned_frames:
-                fifo.write(clean_frame)
-            
-            # --- SLICE IT (Read exact chunks) ---
-            while fifo.samples >= CHUNK_SIZE:
-                if frame_idx >= total_frames: break
+        for raw in packet.decode():
+            for frame in resampler.resample(raw):
+                fifo.write(frame)
 
-                # Read 1920 samples (Exact 40ms)
-                audio_frame = fifo.read(CHUNK_SIZE)
-                
-                # --- READ VIDEO FRAME ---
-                img = cv2.imread(frame_files[frame_idx])
-                frame_idx += 1
+            while fifo.samples >= AUDIO_SAMPLES:
+                if audio_pts >= total_audio_samples:
+                    break
 
-                # --- SET TIMESTAMPS ---
-                audio_frame.pts = pts_counter * CHUNK_SIZE
-                audio_frame.time_base = fractions.Fraction(1, AUDIO_RATE)
-                
-                video_frame = VideoFrame.from_ndarray(img, format="bgr24")
-                video_frame.pts = pts_counter * 3600
-                video_frame.time_base = fractions.Fraction(1, 90000)
+                audio = fifo.read(AUDIO_SAMPLES)
+                audio.pts = audio_pts
+                audio.time_base = fractions.Fraction(1, AUDIO_RATE)
+                audio_pts += AUDIO_SAMPLES
 
-                # --- PUSH TO BUFFER A ---
-                await raw_a_q.put(audio_frame)
-                await raw_v_q.put(video_frame)
-                pts_counter += 1
-                
-                # Simulate Inference Speed
+                await raw_audio_q.put(audio)
+
+                if video_idx < num_video_frames:
+                    img = cv2.imread(frames[video_idx])
+                    video_idx += 1
+
+                    video = VideoFrame.from_ndarray(img, format="bgr24")
+                    video.pts = video_pts
+                    video.time_base = fractions.Fraction(1, VIDEO_CLOCK)
+                    video_pts += VIDEO_FRAME_TICKS
+
+                    await raw_video_q.put(video)
+
+                # simulate fast inference
                 await asyncio.sleep(0.001)
-        
-        if frame_idx >= total_frames: break
 
-    # Signal End
-    await raw_a_q.put(None)
-    await raw_v_q.put(None)
-    logger.info(f">>> Producer: Finished. Generated {frame_idx} frames.")
-# --- 4. SERVER SETUP ---
+        if audio_pts >= total_audio_samples:
+            break
+
+    await raw_audio_q.put(None)
+    await raw_video_q.put(None)
+
+    logger.info(
+        f"Producer finished: "
+        f"{video_idx} video frames, "
+        f"{audio_pts / AUDIO_RATE:.2f}s audio"
+    )
+# ===========================================
+
+
+# ============ AUDIO-CLOCK PACER =============
+async def audio_clock_pacer(raw_audio_q, raw_video_q, out_audio_q, out_video_q):
+    logger.info("Pacer: audio clock master")
+
+    start_time = time.time()
+    audio_samples_sent = 0
+    video_buffer = []
+
+    audio_done = False
+    video_done = False
+
+    while True:
+        # ---- AUDIO ----
+        if not audio_done:
+            audio = await raw_audio_q.get()
+            if audio is None:
+                audio_done = True
+            else:
+                target_time = start_time + (audio_samples_sent / AUDIO_RATE)
+                await asyncio.sleep(max(0, target_time - time.time()))
+
+                await out_audio_q.put(audio)
+                audio_samples_sent += audio.samples
+
+        # ---- VIDEO INGEST ----
+        while not raw_video_q.empty():
+            v = await raw_video_q.get()
+            if v is None:
+                video_done = True
+            else:
+                video_buffer.append(v)
+
+        # ---- VIDEO RELEASE ----
+        current_time = audio_samples_sent / AUDIO_RATE
+        while video_buffer:
+            next_v = video_buffer[0]
+            v_time = float(next_v.pts * next_v.time_base)
+            if v_time <= current_time:
+                await out_video_q.put(video_buffer.pop(0))
+            else:
+                break
+
+        # ---- EXIT ----
+        if audio_done and video_done and not video_buffer:
+            await out_audio_q.put(None)
+            await out_video_q.put(None)
+            break
+# ===========================================
+
+
+# ============ WEBRTC SERVER =================
+pcs = set()
+
 async def index(request):
-    content = open("index.html", "r").read()
-    return web.Response(content_type="text/html", text=content)
+    return web.Response(
+        content_type="text/html",
+        text=open("index.html").read(),
+    )
+
 
 async def offer(request):
     params = await request.json()
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    offer = RTCSessionDescription(**params)
 
     pc = RTCPeerConnection()
     pcs.add(pc)
 
-    # Buffer A: Unlimited storage for the fast model
-    raw_v_q = asyncio.Queue()
-    raw_a_q = asyncio.Queue()
+    raw_audio_q = asyncio.Queue()
+    raw_video_q = asyncio.Queue()
+    out_audio_q = asyncio.Queue()
+    out_video_q = asyncio.Queue()
 
-    # Buffer B: The output buffer that the Pacer feeds
-    slow_v_q = asyncio.Queue()
-    slow_a_q = asyncio.Queue()
+    pc.addTrack(ConsumerAudioTrack(out_audio_q))
+    pc.addTrack(ConsumerVideoTrack(out_video_q))
 
-    # Tracks read from Buffer B
-    pc.addTrack(ConsumerVideoTrack(slow_v_q))
-    pc.addTrack(ConsumerAudioTrack(slow_a_q))
-
-    # Start the machinery
-    # 1. Start Producer (Fills Buffer A)
-    asyncio.create_task(fast_producer(raw_v_q, raw_a_q))
-    # 2. Start Pacer (Moves A -> B slowly)
-    asyncio.create_task(strict_pacer(raw_v_q, raw_a_q, slow_v_q, slow_a_q))
-
-    @pc.on("iceconnectionstatechange")
-    async def on_iceconnectionstatechange():
-        if pc.iceConnectionState == "failed":
-            await pc.close()
-            pcs.discard(pc)
+    asyncio.create_task(fast_producer(raw_audio_q, raw_video_q))
+    asyncio.create_task(audio_clock_pacer(
+        raw_audio_q, raw_video_q,
+        out_audio_q, out_video_q
+    ))
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
-    return web.json_response({
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type
-    })
+    return web.json_response(
+        {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+        }
+    )
 
-pcs = set()
 
 if __name__ == "__main__":
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_post("/offer", offer)
+
     print("Server running at http://localhost:8080")
     web.run_app(app, port=8080)

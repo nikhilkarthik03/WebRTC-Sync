@@ -1,54 +1,51 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
-<head>
-    <title>WebRTC LipSync Test</title>
+  <head>
+    <title>WebRTC Test</title>
     <style>
-        body { background: #111; color: white; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; }
-        video { width: 640px; height: 480px; background: black; margin-top: 20px; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px; }
+      body {
+        background: #111;
+        color: white;
+        text-align: center;
+      }
+      video {
+        width: 640px;
+        height: 480px;
+        background: black;
+      }
     </style>
-</head>
-<body>
-    <h1>LipSync Latency Test</h1>
-    <button onclick="start()">Start Streaming</button>
+  </head>
+  <body>
+    <h2>WebRTC Audio-Correct Streaming</h2>
+    <button onclick="start()">Start</button>
     <video id="video" autoplay playsinline controls></video>
-    <div id="status">Ready</div>
 
     <script>
-        async function start() {
-            const pc = new RTCPeerConnection();
-            const status = document.getElementById("status");
-            
-            // 1. Hook up the video element
-            pc.ontrack = (evt) => {
-                if (evt.track.kind === 'video') {
-                    document.getElementById("video").srcObject = evt.streams[0];
-                    status.innerText = "Receiving Stream...";
-                }
-            };
+      async function start() {
+        const pc = new RTCPeerConnection();
 
-            // 2. Create Offer (We want to receive, so we offer to recv only)
-            pc.addTransceiver('video', {direction: 'recvonly'});
-            pc.addTransceiver('audio', {direction: 'recvonly'});
+        pc.ontrack = (e) => {
+          document.getElementById("video").srcObject = e.streams[0];
+        };
 
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
+        pc.addTransceiver("audio", { direction: "recvonly" });
+        pc.addTransceiver("video", { direction: "recvonly" });
 
-            // 3. Send to Python Server
-            status.innerText = "Negotiating...";
-            const response = await fetch('/offer', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    sdp: pc.localDescription.sdp,
-                    type: pc.localDescription.type
-                })
-            });
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
 
-            // 4. Handle Answer
-            const answer = await response.json();
-            await pc.setRemoteDescription(answer);
-        }
+        const res = await fetch("/offer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sdp: offer.sdp,
+            type: offer.type,
+          }),
+        });
+
+        const answer = await res.json();
+        await pc.setRemoteDescription(answer);
+      }
     </script>
-</body>
+  </body>
 </html>
